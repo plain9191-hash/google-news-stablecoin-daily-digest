@@ -1,0 +1,51 @@
+name: Google News Stablecoin Daily Digest
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 08:00 Asia/Seoul = 23:00 UTC (previous day)
+    - cron: "0 23 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: google-news-stablecoin-digest
+  cancel-in-progress: false
+
+jobs:
+  send_digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: google-news-stablecoin-daily-digest/requirements.txt
+
+      - name: Install dependencies
+        working-directory: google-news-stablecoin-daily-digest
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run stablecoin digest workflow
+        working-directory: google-news-stablecoin-daily-digest
+        env:
+          TASK_NAME: google_news_stablecoin_daily_digest
+          RSS_URL_KR: ${{ secrets.STABLECOIN_RSS_URL_KR || 'https://news.google.com/rss/search?q=intitle:%22%EC%8A%A4%ED%85%8C%EC%9D%B4%EB%B8%94%EC%BD%94%EC%9D%B8%22&hl=ko&gl=KR&ceid=KR:ko' }}
+          RSS_URL_US: ${{ secrets.STABLECOIN_RSS_URL_US || 'https://news.google.com/rss/search?q=intitle:stablecoin&hl=en-US&gl=US&ceid=US:en' }}
+          HOURS_BACK: "24"
+          MAX_ITEMS: "100"
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+        run: python stablecoin_digest.py
