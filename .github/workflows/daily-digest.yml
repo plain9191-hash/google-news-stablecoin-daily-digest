@@ -37,8 +37,8 @@ jobs:
       - name: Run stablecoin digest workflow
         env:
           TASK_NAME: google_news_stablecoin_daily_digest
-          RSS_URL_KR: ${{ secrets.STABLECOIN_RSS_URL_KR }}
-          RSS_URL_US: ${{ secrets.STABLECOIN_RSS_URL_US }}
+          RSS_URL_KR: ${{ secrets.RSS_URL_KR }}
+          RSS_URL_US: ${{ secrets.RSS_URL_US }}
           HOURS_BACK: "24"
           MAX_ITEMS: "100"
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
