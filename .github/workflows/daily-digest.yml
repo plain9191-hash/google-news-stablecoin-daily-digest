@@ -3,8 +3,8 @@ name: Google News Stablecoin Daily Digest
 on:
   workflow_dispatch:
   schedule:
-    # 08:00 Asia/Seoul = 23:00 UTC (previous day)
-    - cron: "0 23 * * *"
+    # 06:00 Asia/Seoul = 21:00 UTC (previous day)
+    - cron: "0 21 * * *"
 
 permissions:
   contents: read
