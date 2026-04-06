@@ -53,6 +53,22 @@ def get_env(name: str, default: str | None = None, required: bool = False) -> st
     return value or ""
 
 
+def is_truthy(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_positive_int(name: str, raw: str, *, minimum: int = 1, maximum: int | None = None) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer.") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} must be >= {minimum}.")
+    if maximum is not None and value > maximum:
+        raise RuntimeError(f"{name} must be <= {maximum}.")
+    return value
+
+
 def parse_entry_datetime(raw_entry: dict[str, Any]) -> datetime | None:
     for key in ("published", "updated", "created"):
         raw = raw_entry.get(key)
@@ -225,22 +241,57 @@ def send_gmail(sender: str, to_email: str, subject: str, body: str, html_body: s
     service.users().messages().send(userId="me", body={"raw": raw}).execute()
 
 
-def main() -> None:
-    load_dotenv()
-
-    task_name = get_env("TASK_NAME", TASK_NAME)
+def validate_configuration() -> dict[str, Any]:
+    task_name = get_env("TASK_NAME", TASK_NAME).strip()
     if task_name != TASK_NAME:
         raise RuntimeError(f"TASK_NAME must be '{TASK_NAME}'")
 
-    rss_url_kr = get_env("RSS_URL_KR", DEFAULT_RSS_URL_KR)
-    rss_url_us = get_env("RSS_URL_US", DEFAULT_RSS_URL_US)
+    rss_url_kr = get_env("RSS_URL_KR", DEFAULT_RSS_URL_KR).strip()
+    rss_url_us = get_env("RSS_URL_US", DEFAULT_RSS_URL_US).strip()
+    to_email = get_env("TO_EMAIL", required=True).strip()
+    from_email = get_env("FROM_EMAIL", required=True).strip()
 
-    to_email = get_env("TO_EMAIL", required=True)
-    from_email = get_env("FROM_EMAIL", required=True)
+    hours_back = parse_positive_int("HOURS_BACK", get_env("HOURS_BACK", "24"))
+    max_items = parse_positive_int("MAX_ITEMS", get_env("MAX_ITEMS", "100"), maximum=100)
 
-    hours_back = int(get_env("HOURS_BACK", "24"))
-    max_items_raw = int(get_env("MAX_ITEMS", "100"))
-    max_items = max(1, min(max_items_raw, 100))
+    client_id = get_env("GOOGLE_CLIENT_ID", required=True).strip()
+    client_secret = get_env("GOOGLE_CLIENT_SECRET", required=True).strip()
+    refresh_token = get_env("GOOGLE_REFRESH_TOKEN", required=True).strip()
+    validate_only = is_truthy(get_env("VALIDATE_ONLY", ""))
+
+    return {
+        "task_name": task_name,
+        "rss_url_kr": rss_url_kr,
+        "rss_url_us": rss_url_us,
+        "to_email": to_email,
+        "from_email": from_email,
+        "hours_back": hours_back,
+        "max_items": max_items,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+        "validate_only": validate_only,
+    }
+
+
+def main() -> None:
+    load_dotenv()
+
+    config = validate_configuration()
+
+    rss_url_kr = config["rss_url_kr"]
+    rss_url_us = config["rss_url_us"]
+    to_email = config["to_email"]
+    from_email = config["from_email"]
+    hours_back = config["hours_back"]
+    max_items = config["max_items"]
+
+    if config["validate_only"]:
+        print(
+            "Configuration valid for "
+            f"{config['task_name']}: to={to_email}, hours_back={hours_back}, max_items={max_items}"
+        )
+        return
 
     jobs = [
         ("KR", KEYWORD_KR, rss_url_kr),
