@@ -2,9 +2,6 @@ name: Google News Stablecoin Daily Digest
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - codex/fix-ci-and-preflight
   schedule:
     # 08:00 Asia/Seoul = 23:00 UTC (previous day)
     - cron: "0 23 * * *"
