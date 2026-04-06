@@ -4,14 +4,14 @@
 - Fetch Google News RSS
 - Keep titles containing the target keyword
 - Sort by latest first and keep up to MAX_ITEMS (max 100)
-- Send email via Gmail OAuth refresh token
+- Send email via Gmail SMTP with App Password
 """
 
 from __future__ import annotations
 
-import base64
 import html
 import os
+import smtplib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
@@ -21,8 +21,6 @@ from typing import Any
 import feedparser
 from dateutil import parser as dt_parser
 from dotenv import load_dotenv
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
 
 TASK_NAME = "google_news_stablecoin_daily_digest"
 DEFAULT_RSS_URL_KR = (
@@ -33,7 +31,8 @@ DEFAULT_RSS_URL_KR = (
 DEFAULT_RSS_URL_US = "https://news.google.com/rss/search?q=intitle:stablecoin&hl=en-US&gl=US&ceid=US:en"
 KEYWORD_KR = "스테이블코인"
 KEYWORD_US = "stablecoin"
-GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+GMAIL_SMTP_HOST = "smtp.gmail.com"
+GMAIL_SMTP_PORT = 587
 
 
 @dataclass
@@ -215,20 +214,7 @@ def build_email_html(entries: list[NewsEntry], keyword: str, hours_back: int) ->
 
 
 def send_gmail(sender: str, to_email: str, subject: str, body: str, html_body: str) -> None:
-    client_id = get_env("GOOGLE_CLIENT_ID", required=True)
-    client_secret = get_env("GOOGLE_CLIENT_SECRET", required=True)
-    refresh_token = get_env("GOOGLE_REFRESH_TOKEN", required=True)
-
-    creds = Credentials(
-        token=None,
-        refresh_token=refresh_token,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=client_id,
-        client_secret=client_secret,
-        scopes=[GMAIL_SCOPE],
-    )
-
-    service = build("gmail", "v1", credentials=creds)
+    app_password = get_env("GMAIL_APP_PASSWORD", required=True)
 
     msg = MIMEMultipart("alternative")
     msg["to"] = to_email
@@ -237,8 +223,11 @@ def send_gmail(sender: str, to_email: str, subject: str, body: str, html_body: s
     msg.attach(MIMEText(body, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
-    service.users().messages().send(userId="me", body={"raw": raw}).execute()
+    with smtplib.SMTP(GMAIL_SMTP_HOST, GMAIL_SMTP_PORT) as smtp:
+        smtp.ehlo()
+        smtp.starttls()
+        smtp.login(sender, app_password)
+        smtp.sendmail(sender, to_email, msg.as_string())
 
 
 def validate_configuration() -> dict[str, Any]:
@@ -254,9 +243,7 @@ def validate_configuration() -> dict[str, Any]:
     hours_back = parse_positive_int("HOURS_BACK", get_env("HOURS_BACK", "24"))
     max_items = parse_positive_int("MAX_ITEMS", get_env("MAX_ITEMS", "100"), maximum=100)
 
-    client_id = get_env("GOOGLE_CLIENT_ID", required=True).strip()
-    client_secret = get_env("GOOGLE_CLIENT_SECRET", required=True).strip()
-    refresh_token = get_env("GOOGLE_REFRESH_TOKEN", required=True).strip()
+    app_password = get_env("GMAIL_APP_PASSWORD", required=True).strip()
     validate_only = is_truthy(get_env("VALIDATE_ONLY", ""))
 
     return {
@@ -267,9 +254,7 @@ def validate_configuration() -> dict[str, Any]:
         "from_email": from_email,
         "hours_back": hours_back,
         "max_items": max_items,
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "refresh_token": refresh_token,
+        "app_password": app_password,
         "validate_only": validate_only,
     }
 
