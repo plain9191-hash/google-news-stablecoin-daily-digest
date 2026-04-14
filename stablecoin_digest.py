@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """Google News Stablecoin daily digest sender.
 
-- Fetch Google News RSS
-- Keep titles containing the target keyword
-- Sort by latest first and keep up to MAX_ITEMS (max 100)
-- Send email via Gmail SMTP with App Password
+- Fetch Google News RSS (KR + US)
+- Curate top 4-5 articles via Claude API (deduplicate by topic, prioritise for stablecoin teams)
+- Send a single newsletter email via Gmail SMTP with App Password
 """
 
 from __future__ import annotations
 
 import html
+import json
 import os
 import smtplib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any
 
+import anthropic
 import feedparser
 from dateutil import parser as dt_parser
 from dotenv import load_dotenv
@@ -33,6 +34,7 @@ KEYWORD_KR = "스테이블코인"
 KEYWORD_US = "stablecoin"
 GMAIL_SMTP_HOST = "smtp.gmail.com"
 GMAIL_SMTP_PORT = 587
+WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
 
 
 @dataclass
@@ -41,6 +43,7 @@ class NewsEntry:
     link: str
     published_at: datetime
     source: str
+    description: str = field(default="")
 
 
 def get_env(name: str, default: str | None = None, required: bool = False) -> str:
@@ -122,12 +125,15 @@ def fetch_google_news(rss_url: str, keyword: str, max_items: int, hours_back: in
         if isinstance(source_raw, dict):
             source = str(source_raw.get("title") or "").strip()
 
+        description = (raw.get("summary") or "").strip()
+
         entries.append(
             NewsEntry(
                 title=title,
                 link=link,
                 published_at=published_at,
                 source=source,
+                description=description,
             )
         )
 
@@ -135,81 +141,135 @@ def fetch_google_news(rss_url: str, keyword: str, max_items: int, hours_back: in
     return entries[:max_items]
 
 
-def build_email_body(entries: list[NewsEntry], keyword: str, hours_back: int) -> str:
-    lines: list[str] = []
-    lines.append(f"Google News Daily Digest - '{keyword}'")
-    lines.append("")
-    lines.append(f"총 {len(entries)}개 기사 (최근 {hours_back}시간, 최신순)")
-    lines.append("")
+def curate_articles(all_entries: list[NewsEntry]) -> dict[str, Any]:
+    """Call Claude to select top 4-5 articles and generate summaries."""
+    client = anthropic.Anthropic()
 
-    if not entries:
-        lines.append("오늘은 조건에 맞는 기사가 없습니다.")
+    articles_text = ""
+    for i, e in enumerate(all_entries, 1):
+        desc_line = f"\n   발췌: {e.description[:200]}" if e.description else ""
+        articles_text += (
+            f"[{i}] {e.title}\n"
+            f"   출처: {e.source or '불명'} | {e.published_at.strftime('%m/%d %H:%M')} UTC\n"
+            f"   링크: {e.link}{desc_line}\n\n"
+        )
+
+    prompt = f"""다음은 수집된 스테이블코인 관련 뉴스 기사 목록입니다.
+
+{articles_text}
+선별 기준에 따라 4~5개 기사를 고르고 아래 JSON 형식으로만 응답해주세요.
+
+선별 기준:
+1. 중복 주제(비슷한 내용) 기사가 많을수록 우선 선별 — 그 중 가장 대표적인 1개만 선택
+2. 스테이블코인 발행·유통 실무팀에게 중요한 뉴스 우선 (규제·법안, 주요 발행사 동향, 시장 구조 변화, 채택 확대 등)
+
+JSON 형식 (다른 텍스트 없이 JSON만 응답):
+{{
+  "headline": "오늘 스테이블코인 시장 핵심을 한 문장으로 요약 (한국어)",
+  "articles": [
+    {{
+      "index": <원본 기사 번호 정수>,
+      "summary": "기사 핵심 내용 2~3줄 요약 (한국어, 개행 없이 한 단락)"
+    }}
+  ]
+}}"""
+
+    with client.messages.stream(
+        model="claude-opus-4-6",
+        max_tokens=2048,
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        text = stream.get_final_message().content[0].text
+
+    # Strip markdown code fences if present
+    text = text.strip()
+    if text.startswith("```"):
+        parts = text.split("```")
+        text = parts[1] if len(parts) > 1 else parts[0]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+
+    return json.loads(text)
+
+
+def build_newsletter_body(curated: dict[str, Any], all_entries: list[NewsEntry], today: datetime) -> str:
+    weekday = WEEKDAY_KR[today.weekday()]
+    date_str = today.strftime("%y.%m.%d")
+    header = f"[{date_str} ({weekday}) 스테이블코인 Newsletter]"
+    headline = curated.get("headline", "")
+
+    lines = [header, "뉴스레터 공유 드립니다.", headline, ""]
+
+    for seq, item in enumerate(curated.get("articles", []), 1):
+        idx = item.get("index", 0)
+        if idx < 1 or idx > len(all_entries):
+            continue
+        e = all_entries[idx - 1]
+        source_part = f" | {e.source}" if e.source else ""
+        lines.append(f"{seq}. {compact_title(e.title)}{source_part}")
+        lines.append(f"   {e.link}")
+        lines.append(f"   | {item.get('summary', '')}")
         lines.append("")
 
-    for idx, e in enumerate(entries, start=1):
-        source = f" ({e.source})" if e.source else ""
-        lines.append(f"[{idx}] {compact_title(e.title)}{source}")
-        lines.append(f"- 링크: {e.link}")
-        lines.append(f"- 게시시각(UTC): {e.published_at.isoformat()}")
-        lines.append("")
-
-    lines.append(f"Generated at (UTC): {datetime.now(timezone.utc).isoformat()}")
+    lines.append(f"Generated at (UTC): {today.isoformat()}")
     return "\n".join(lines)
 
 
-def build_email_html(entries: list[NewsEntry], keyword: str, hours_back: int) -> str:
+def build_newsletter_html(curated: dict[str, Any], all_entries: list[NewsEntry], today: datetime) -> str:
+    weekday = WEEKDAY_KR[today.weekday()]
+    date_str = today.strftime("%y.%m.%d")
+    header = html.escape(f"[{date_str} ({weekday}) 스테이블코인 Newsletter]")
+    headline = html.escape(curated.get("headline", ""))
+
     rows: list[str] = []
-    for idx, e in enumerate(entries, start=1):
-        source = f" ({html.escape(e.source)})" if e.source else ""
+    for seq, item in enumerate(curated.get("articles", []), 1):
+        idx = item.get("index", 0)
+        if idx < 1 or idx > len(all_entries):
+            continue
+        e = all_entries[idx - 1]
         title = html.escape(compact_title(e.title))
         link = html.escape(e.link)
-        posted = html.escape(e.published_at.isoformat())
+        source_part = f" | {html.escape(e.source)}" if e.source else ""
+        summary = html.escape(item.get("summary", ""))
         rows.append(
-            "<article class=\"card\">"
-            f"<strong class=\"title\">[{idx}] {title}{source}</strong>"
-            f"<div class=\"link\"><a href=\"{link}\">{link}</a></div>"
-            f"<div class=\"meta\">게시시각(UTC): {posted}</div>"
+            '<article class="card">'
+            f'<div class="art-title">{seq}. <a href="{link}">{title}</a>{source_part}</div>'
+            f'<div class="art-summary">| {summary}</div>'
             "</article>"
         )
 
-    empty_block = ""
-    if not entries:
-        empty_block = (
-            "<article class=\"card\">"
-            "<strong class=\"title\">오늘은 조건에 맞는 기사가 없습니다.</strong>"
-            "</article>"
-        )
+    if not rows:
+        rows.append('<article class="card"><div class="art-title">오늘은 조건에 맞는 기사가 없습니다.</div></article>')
 
-    generated = html.escape(datetime.now(timezone.utc).isoformat())
+    generated = html.escape(today.isoformat())
     return (
-        "<!doctype html>"
-        "<html><head><meta charset=\"utf-8\">"
-        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-        "<style>"
-        "body{margin:0;background:#f6f7f9;color:#1f2937;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;}"
-        ".wrap{max-width:760px;margin:0 auto;padding:24px 16px 40px;}"
-        ".hero{background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;padding:18px 18px 14px;}"
-        ".headline{margin:0;font-size:22px;line-height:1.25;letter-spacing:-0.02em;}"
-        ".sub{margin:8px 0 0;color:#6b7280;font-size:13px;}"
-        ".section{margin-top:16px;}"
-        ".card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin:10px 0;}"
-        ".title{display:block;font-size:16px;line-height:1.45;}"
-        ".link{margin-top:8px;word-break:break-all;}"
-        ".link a{color:#0f766e;font-size:14px;font-weight:700;text-decoration:none;}"
-        ".link a:hover{text-decoration:underline;}"
-        ".meta{margin-top:6px;font-size:12px;color:#6b7280;word-break:break-all;}"
-        ".foot{margin-top:14px;color:#6b7280;font-size:12px;}"
-        "</style></head><body>"
-        "<div class=\"wrap\">"
-        "<header class=\"hero\">"
-        f"<h1 class=\"headline\">Google News Daily Digest - '{html.escape(keyword)}'</h1>"
-        f"<p class=\"sub\">총 {len(entries)}개 기사 (최근 {hours_back}시간, 최신순, 최대 100개)</p>"
-        "</header>"
-        "<section class=\"section\">"
-        + (empty_block + "".join(rows))
-        + "</section>"
-        f"<div class=\"foot\">Generated at (UTC): {generated}</div>"
-        "</div></body></html>"
+        '<!doctype html>'
+        '<html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        '<style>'
+        'body{margin:0;background:#f6f7f9;color:#1f2937;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}'
+        '.wrap{max-width:720px;margin:0 auto;padding:24px 16px 40px;}'
+        '.hero{background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:18px 20px 16px;margin-bottom:12px;}'
+        '.hero-header{margin:0 0 6px;font-size:17px;font-weight:700;color:#111827;}'
+        '.hero-greeting{margin:0 0 4px;font-size:13px;color:#6b7280;}'
+        '.hero-headline{margin:0;font-size:15px;color:#1f2937;line-height:1.55;}'
+        '.card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:14px 16px;margin:8px 0;}'
+        '.art-title{font-size:15px;font-weight:600;line-height:1.5;}'
+        '.art-title a{color:#0f766e;text-decoration:none;}'
+        '.art-title a:hover{text-decoration:underline;}'
+        '.art-summary{margin-top:8px;font-size:13px;color:#374151;line-height:1.65;}'
+        '.foot{margin-top:14px;color:#9ca3af;font-size:11px;}'
+        '</style></head><body>'
+        '<div class="wrap">'
+        '<div class="hero">'
+        f'<p class="hero-header">{header}</p>'
+        '<p class="hero-greeting">뉴스레터 공유 드립니다.</p>'
+        f'<p class="hero-headline">{headline}</p>'
+        '</div>'
+        + "".join(rows)
+        + f'<div class="foot">Generated at (UTC): {generated}</div>'
+        '</div></body></html>'
     )
 
 
@@ -243,7 +303,8 @@ def validate_configuration() -> dict[str, Any]:
     hours_back = parse_positive_int("HOURS_BACK", get_env("HOURS_BACK", "24"))
     max_items = parse_positive_int("MAX_ITEMS", get_env("MAX_ITEMS", "100"), maximum=100)
 
-    app_password = get_env("GMAIL_APP_PASSWORD", required=True).strip()
+    get_env("GMAIL_APP_PASSWORD", required=True)
+    get_env("ANTHROPIC_API_KEY", required=True)
     validate_only = is_truthy(get_env("VALIDATE_ONLY", ""))
 
     return {
@@ -254,7 +315,6 @@ def validate_configuration() -> dict[str, Any]:
         "from_email": from_email,
         "hours_back": hours_back,
         "max_items": max_items,
-        "app_password": app_password,
         "validate_only": validate_only,
     }
 
@@ -264,32 +324,49 @@ def main() -> None:
 
     config = validate_configuration()
 
-    rss_url_kr = config["rss_url_kr"]
-    rss_url_us = config["rss_url_us"]
     to_email = config["to_email"]
     from_email = config["from_email"]
     hours_back = config["hours_back"]
     max_items = config["max_items"]
 
     if config["validate_only"]:
-        print(
-            "Configuration valid for "
-            f"{config['task_name']}: to={to_email}, hours_back={hours_back}, max_items={max_items}"
-        )
+        print(f"Configuration valid for {config['task_name']}: to={to_email}, hours_back={hours_back}, max_items={max_items}")
         return
 
-    jobs = [
-        ("KR", KEYWORD_KR, rss_url_kr),
-        ("US", KEYWORD_US, rss_url_us),
-    ]
+    kr_entries = fetch_google_news(
+        rss_url=config["rss_url_kr"], keyword=KEYWORD_KR, max_items=max_items, hours_back=hours_back
+    )
+    us_entries = fetch_google_news(
+        rss_url=config["rss_url_us"], keyword=KEYWORD_US, max_items=max_items, hours_back=hours_back
+    )
 
-    for tag, keyword, rss_url in jobs:
-        entries = fetch_google_news(rss_url=rss_url, keyword=keyword, max_items=max_items, hours_back=hours_back)
-        subject = f"[Stablecoin News:{tag}] '{keyword}' Last {hours_back}h - {len(entries)} items"
-        body = build_email_body(entries, keyword=keyword, hours_back=hours_back)
-        html_body = build_email_html(entries, keyword=keyword, hours_back=hours_back)
+    all_entries = kr_entries + us_entries
+    all_entries.sort(key=lambda x: x.published_at.timestamp(), reverse=True)
+
+    print(f"Fetched {len(kr_entries)} KR + {len(us_entries)} US = {len(all_entries)} total articles")
+
+    today = datetime.now(timezone.utc)
+    weekday = WEEKDAY_KR[today.weekday()]
+    date_str = today.strftime("%y.%m.%d")
+    subject = f"[{date_str} ({weekday}) 스테이블코인 Newsletter]"
+
+    if not all_entries:
+        body = f"{subject}\n\n오늘은 조건에 맞는 기사가 없습니다."
+        html_body = (
+            f'<!doctype html><html><body><p>{html.escape(subject)}</p>'
+            '<p>오늘은 조건에 맞는 기사가 없습니다.</p></body></html>'
+        )
         send_gmail(sender=from_email, to_email=to_email, subject=subject, body=body, html_body=html_body)
-        print(f"Sent {tag} stablecoin digest with {len(entries)} items to {to_email}")
+        print("No articles found — sent empty notification")
+        return
+
+    curated = curate_articles(all_entries)
+    body = build_newsletter_body(curated, all_entries, today)
+    html_body = build_newsletter_html(curated, all_entries, today)
+
+    send_gmail(sender=from_email, to_email=to_email, subject=subject, body=body, html_body=html_body)
+    n = len(curated.get("articles", []))
+    print(f"Sent newsletter ({n} curated articles from {len(all_entries)} total) to {to_email}")
 
 
 if __name__ == "__main__":
