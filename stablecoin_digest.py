@@ -147,7 +147,7 @@ def curate_articles(all_entries: list[NewsEntry]) -> dict[str, Any]:
 
     articles_text = ""
     for i, e in enumerate(all_entries, 1):
-        desc_line = f"\n   발췌: {e.description[:200]}" if e.description else ""
+        desc_line = f"\n   본문발췌: {e.description[:300]}" if e.description else ""
         articles_text += (
             f"[{i}] {e.title}\n"
             f"   출처: {e.source or '불명'} | {e.published_at.strftime('%m/%d %H:%M')} UTC\n"
@@ -163,12 +163,18 @@ def curate_articles(all_entries: list[NewsEntry]) -> dict[str, Any]:
 1. 중복 주제(비슷한 내용) 기사가 많을수록 우선 선별 — 그 중 가장 대표적인 1개만 선택
 2. 스테이블코인 발행·유통 실무팀에게 중요한 뉴스 우선 (규제·법안, 주요 발행사 동향, 시장 구조 변화, 채택 확대 등)
 
+요약 작성 지침:
+- 요약은 반드시 한국어로 2~3줄 (개행 없이 한 단락)
+- 본문발췌가 있으면 핵심 수치·사실을 요약에 반영할 것
+- 발행/유통 실무자 관점에서 "무엇이 바뀌는지", "어떤 행동이 필요한지" 중심으로 서술
+
 JSON 형식 (다른 텍스트 없이 JSON만 응답):
 {{
   "headline": "오늘 스테이블코인 시장 핵심을 한 문장으로 요약 (한국어)",
   "articles": [
     {{
       "index": <원본 기사 번호 정수>,
+      "duplicate_count": <이 주제와 유사한 기사 수 (본 기사 포함한 정수)>,
       "summary": "기사 핵심 내용 2~3줄 요약 (한국어, 개행 없이 한 단락)"
     }}
   ]
@@ -206,9 +212,10 @@ def build_newsletter_body(curated: dict[str, Any], all_entries: list[NewsEntry],
         if idx < 1 or idx > len(all_entries):
             continue
         e = all_entries[idx - 1]
+        dup = item.get("duplicate_count", 1)
+        dup_part = f" ({dup}건)" if dup and dup > 1 else ""
         source_part = f" | {e.source}" if e.source else ""
-        lines.append(f"{seq}. {compact_title(e.title)}{source_part}")
-        lines.append(f"   {e.link}")
+        lines.append(f"{seq}. {compact_title(e.title)}{dup_part} ({e.link}{source_part})")
         lines.append(f"   | {item.get('summary', '')}")
         lines.append("")
 
@@ -230,11 +237,13 @@ def build_newsletter_html(curated: dict[str, Any], all_entries: list[NewsEntry],
         e = all_entries[idx - 1]
         title = html.escape(compact_title(e.title))
         link = html.escape(e.link)
-        source_part = f" | {html.escape(e.source)}" if e.source else ""
+        dup = item.get("duplicate_count", 1)
+        dup_badge = f' <span class="badge">{dup}건</span>' if dup and dup > 1 else ""
+        source_part = f' | {html.escape(e.source)}' if e.source else ""
         summary = html.escape(item.get("summary", ""))
         rows.append(
             '<article class="card">'
-            f'<div class="art-title">{seq}. <a href="{link}">{title}</a>{source_part}</div>'
+            f'<div class="art-title">{seq}. <a href="{link}">{title}</a>{dup_badge}{source_part}</div>'
             f'<div class="art-summary">| {summary}</div>'
             "</article>"
         )
@@ -257,6 +266,7 @@ def build_newsletter_html(curated: dict[str, Any], all_entries: list[NewsEntry],
         '.card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:14px 16px;margin:8px 0;}'
         '.art-title{font-size:15px;font-weight:600;line-height:1.5;}'
         '.art-title a{color:#0f766e;text-decoration:none;}'
+        '.badge{display:inline-block;margin-left:5px;padding:1px 7px;background:#fef3c7;color:#92400e;border-radius:99px;font-size:11px;font-weight:600;vertical-align:middle;}'
         '.art-title a:hover{text-decoration:underline;}'
         '.art-summary{margin-top:8px;font-size:13px;color:#374151;line-height:1.65;}'
         '.foot{margin-top:14px;color:#9ca3af;font-size:11px;}'
