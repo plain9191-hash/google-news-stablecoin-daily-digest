@@ -2,15 +2,15 @@
 """Google News Stablecoin daily digest sender.
 
 - Fetch Google News RSS (KR + US)
-- Curate top 4-5 articles via Claude API (deduplicate by topic, prioritise for stablecoin teams)
+- Curate top 4-5 latest articles with rule-based summaries
 - Send a single newsletter email via Gmail SMTP with App Password
 """
 
 from __future__ import annotations
 
 import html
-import json
 import os
+import re
 import smtplib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -18,7 +18,6 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any
 
-import anthropic
 import feedparser
 from dateutil import parser as dt_parser
 from dotenv import load_dotenv
@@ -141,62 +140,38 @@ def fetch_google_news(rss_url: str, keyword: str, max_items: int, hours_back: in
     return entries[:max_items]
 
 
-def curate_articles(all_entries: list[NewsEntry]) -> dict[str, Any]:
-    """Call Claude to select top 4-5 articles and generate summaries."""
-    client = anthropic.Anthropic()
+def _clean_text(raw: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", raw or "")
+    text = html.unescape(text)
+    return " ".join(text.split())
 
-    articles_text = ""
-    for i, e in enumerate(all_entries, 1):
-        desc_line = f"\n   본문발췌: {e.description[:300]}" if e.description else ""
-        articles_text += (
-            f"[{i}] {e.title}\n"
-            f"   출처: {e.source or '불명'} | {e.published_at.strftime('%m/%d %H:%M')} UTC\n"
-            f"   링크: {e.link}{desc_line}\n\n"
+
+def _build_local_summary(entry: NewsEntry) -> str:
+    excerpt = _clean_text(entry.description)
+    if excerpt:
+        if len(excerpt) > 220:
+            excerpt = excerpt[:219].rstrip() + "…"
+        return excerpt
+    source = entry.source or "주요 매체"
+    posted = entry.published_at.strftime("%m/%d %H:%M UTC")
+    return f"{source} 보도. 게시시각 {posted}. 상세 내용은 링크를 참고하세요."
+
+
+def curate_articles(all_entries: list[NewsEntry]) -> dict[str, Any]:
+    """Select top 5 latest articles and generate rule-based summaries."""
+    selected = all_entries[: min(5, len(all_entries))]
+    articles: list[dict[str, Any]] = []
+    for idx, entry in enumerate(selected, start=1):
+        articles.append(
+            {
+                "index": idx,
+                "duplicate_count": 1,
+                "summary": _build_local_summary(entry),
+            }
         )
 
-    prompt = f"""다음은 수집된 스테이블코인 관련 뉴스 기사 목록입니다.
-
-{articles_text}
-선별 기준에 따라 4~5개 기사를 고르고 아래 JSON 형식으로만 응답해주세요.
-
-선별 기준:
-1. 중복 주제(비슷한 내용) 기사가 많을수록 우선 선별 — 그 중 가장 대표적인 1개만 선택
-2. 스테이블코인 발행·유통 실무팀에게 중요한 뉴스 우선 (규제·법안, 주요 발행사 동향, 시장 구조 변화, 채택 확대 등)
-
-요약 작성 지침:
-- 요약은 반드시 한국어로 2~3줄 (개행 없이 한 단락)
-- 본문발췌가 있으면 핵심 수치·사실을 요약에 반영할 것
-- 발행/유통 실무자 관점에서 "무엇이 바뀌는지", "어떤 행동이 필요한지" 중심으로 서술
-
-JSON 형식 (다른 텍스트 없이 JSON만 응답):
-{{
-  "headline": "오늘 스테이블코인 시장 핵심을 한 문장으로 요약 (한국어)",
-  "articles": [
-    {{
-      "index": <원본 기사 번호 정수>,
-      "duplicate_count": <이 주제와 유사한 기사 수 (본 기사 포함한 정수)>,
-      "summary": "기사 핵심 내용 2~3줄 요약 (한국어, 개행 없이 한 단락)"
-    }}
-  ]
-}}"""
-
-    with client.messages.stream(
-        model="claude-opus-4-6",
-        max_tokens=2048,
-        messages=[{"role": "user", "content": prompt}],
-    ) as stream:
-        text = stream.get_final_message().content[0].text
-
-    # Strip markdown code fences if present
-    text = text.strip()
-    if text.startswith("```"):
-        parts = text.split("```")
-        text = parts[1] if len(parts) > 1 else parts[0]
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.strip()
-
-    return json.loads(text)
+    headline = f"최근 수집된 {len(all_entries)}건 중 핵심 {len(articles)}건을 정리했습니다."
+    return {"headline": headline, "articles": articles}
 
 
 def build_newsletter_body(curated: dict[str, Any], all_entries: list[NewsEntry], today: datetime) -> str:
@@ -314,7 +289,6 @@ def validate_configuration() -> dict[str, Any]:
     max_items = parse_positive_int("MAX_ITEMS", get_env("MAX_ITEMS", "100"), maximum=100)
 
     get_env("GMAIL_APP_PASSWORD", required=True)
-    get_env("ANTHROPIC_API_KEY", required=True)
     validate_only = is_truthy(get_env("VALIDATE_ONLY", ""))
 
     return {
