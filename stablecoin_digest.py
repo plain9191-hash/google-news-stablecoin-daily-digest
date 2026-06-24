@@ -2,16 +2,21 @@
 """Google News Stablecoin daily digest sender.
 
 - Fetch Google News RSS (KR + US)
-- Curate top 4-5 latest articles with rule-based summaries
+- Curate top 4-5 articles via Claude (Pro/Max 구독 인증, claude CLI 헤드리스 호출):
+  주제별 중복 병합 + 실무 중요도 우선순위 + 한국어 요약 생성
+- Claude 호출 실패 시 룰 기반 큐레이션으로 자동 대체
 - Send a single newsletter email via Gmail SMTP with App Password
 """
 
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 import smtplib
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
@@ -34,6 +39,13 @@ KEYWORD_US = "stablecoin"
 GMAIL_SMTP_HOST = "smtp.gmail.com"
 GMAIL_SMTP_PORT = 587
 WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
+
+# Claude 큐레이션 (Pro/Max 구독 인증 — API 키 아님)
+# 로컬: 'claude' 로그인 세션 사용 / CI: CLAUDE_CODE_OAUTH_TOKEN 시크릿
+DEFAULT_CLAUDE_MODEL = "sonnet"
+CLAUDE_TIMEOUT_SEC = 180
+CLAUDE_RETRIES = 2
+CLAUDE_MAX_INPUT = 50  # Claude 프롬프트에 넘길 최신 기사 최대 개수
 
 
 @dataclass
@@ -157,8 +169,8 @@ def _build_local_summary(entry: NewsEntry) -> str:
     return f"{source} 보도. 게시시각 {posted}. 상세 내용은 링크를 참고하세요."
 
 
-def curate_articles(all_entries: list[NewsEntry]) -> dict[str, Any]:
-    """Select top 5 latest articles and generate rule-based summaries."""
+def _rule_based_curate(all_entries: list[NewsEntry]) -> dict[str, Any]:
+    """Fallback: 최신 5건을 그대로 선택하고 RSS 발췌로 요약 (Claude 실패 시에만 사용)."""
     selected = all_entries[: min(5, len(all_entries))]
     articles: list[dict[str, Any]] = []
     for idx, entry in enumerate(selected, start=1):
@@ -170,8 +182,128 @@ def curate_articles(all_entries: list[NewsEntry]) -> dict[str, Any]:
             }
         )
 
-    headline = f"최근 수집된 {len(all_entries)}건 중 핵심 {len(articles)}건을 정리했습니다."
+    headline = f"최근 수집된 {len(all_entries)}건 중 최신 {len(articles)}건을 정리했습니다."
     return {"headline": headline, "articles": articles}
+
+
+def ask_claude(prompt: str, *, model: str, timeout: int) -> str:
+    """Claude Code CLI 헤드리스 호출 — Pro/Max 구독 과금.
+
+    로컬에서는 'claude' 로그인 세션을, CI에서는 CLAUDE_CODE_OAUTH_TOKEN 환경변수를 사용한다.
+    """
+    result = subprocess.run(
+        ["claude", "-p", prompt, "--model", model, "--output-format", "text"],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _extract_json_object(raw: str) -> str:
+    """모델 응답에서 JSON 객체만 추출 (코드펜스/잡텍스트 제거)."""
+    text = raw.strip()
+    if text.startswith("```"):
+        parts = text.split("```")
+        text = parts[1] if len(parts) > 1 else parts[0]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        text = text[start : end + 1]
+    return text
+
+
+def _claude_curate(all_entries: list[NewsEntry], *, model: str, timeout: int) -> dict[str, Any]:
+    """Claude로 4~5건 선별 + 주제별 중복 병합 + 한국어 요약 생성. 실패 시 예외 발생."""
+    subset = all_entries[:CLAUDE_MAX_INPUT]
+
+    articles_text = ""
+    for i, e in enumerate(subset, 1):
+        excerpt = _clean_text(e.description)
+        desc_line = f"\n   본문발췌: {excerpt[:300]}" if excerpt else ""
+        articles_text += (
+            f"[{i}] {e.title}\n"
+            f"   출처: {e.source or '불명'} | {e.published_at.strftime('%m/%d %H:%M')} UTC\n"
+            f"   링크: {e.link}{desc_line}\n\n"
+        )
+
+    prompt = f"""다음은 수집된 스테이블코인 관련 뉴스 기사 목록입니다.
+
+{articles_text}
+선별 기준에 따라 4~5개 기사를 고르고 아래 JSON 형식으로만 응답해주세요.
+
+선별 기준:
+1. 중복 주제(비슷한 내용) 기사가 많을수록 우선 선별 — 그 중 가장 대표적인 1개만 선택
+2. 스테이블코인 발행·유통 실무팀에게 중요한 뉴스 우선 (규제·법안, 주요 발행사 동향, 시장 구조 변화, 채택 확대 등)
+
+요약 작성 지침:
+- 요약은 반드시 한국어로 2~3줄 (개행 없이 한 단락)
+- 본문발췌가 있으면 핵심 수치·사실을 요약에 반영할 것
+- 발행/유통 실무자 관점에서 "무엇이 바뀌는지", "어떤 행동이 필요한지" 중심으로 서술
+
+JSON 형식 (다른 텍스트 없이 JSON만 응답):
+{{
+  "headline": "오늘 스테이블코인 시장 핵심을 한 문장으로 요약 (한국어)",
+  "articles": [
+    {{
+      "index": <원본 기사 번호 정수>,
+      "duplicate_count": <이 주제와 유사한 기사 수 (본 기사 포함한 정수)>,
+      "summary": "기사 핵심 내용 2~3줄 요약 (한국어, 개행 없이 한 단락)"
+    }}
+  ]
+}}"""
+
+    raw = ask_claude(prompt, model=model, timeout=timeout)
+    data = json.loads(_extract_json_object(raw))
+
+    raw_articles = data.get("articles")
+    if not isinstance(raw_articles, list) or not raw_articles:
+        raise ValueError("Claude 응답에 articles 배열이 없습니다.")
+
+    cleaned: list[dict[str, Any]] = []
+    seen_idx: set[int] = set()
+    for item in raw_articles:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("index", 0))
+        except (TypeError, ValueError):
+            continue
+        if idx < 1 or idx > len(subset) or idx in seen_idx:
+            continue
+        seen_idx.add(idx)
+        try:
+            dup = int(item.get("duplicate_count", 1) or 1)
+        except (TypeError, ValueError):
+            dup = 1
+        summary = str(item.get("summary", "")).strip() or _build_local_summary(all_entries[idx - 1])
+        cleaned.append({"index": idx, "duplicate_count": max(1, dup), "summary": summary})
+
+    if not cleaned:
+        raise ValueError("Claude 응답에서 유효한 기사 index를 찾지 못했습니다.")
+
+    headline = str(data.get("headline", "")).strip()
+    return {"headline": headline, "articles": cleaned}
+
+
+def curate_articles(all_entries: list[NewsEntry]) -> dict[str, Any]:
+    """Claude 큐레이션 시도(재시도 포함). 실패하면 룰 기반으로 자동 대체."""
+    model = get_env("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL
+    last_err: Exception | None = None
+    for attempt in range(1, CLAUDE_RETRIES + 1):
+        try:
+            curated = _claude_curate(all_entries, model=model, timeout=CLAUDE_TIMEOUT_SEC)
+            print(f"Claude curation OK (model={model}, {len(curated['articles'])} articles)")
+            return curated
+        except Exception as exc:  # noqa: BLE001 — 어떤 실패든 룰 기반으로 graceful degrade
+            last_err = exc
+            print(f"[curate] Claude 시도 {attempt}/{CLAUDE_RETRIES} 실패: {exc}", file=sys.stderr)
+    print(f"[curate] Claude 큐레이션 실패 — 룰 기반으로 대체합니다. (마지막 오류: {last_err})", file=sys.stderr)
+    return _rule_based_curate(all_entries)
 
 
 def build_newsletter_body(curated: dict[str, Any], all_entries: list[NewsEntry], today: datetime) -> str:

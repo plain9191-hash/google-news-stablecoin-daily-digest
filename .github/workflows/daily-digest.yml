@@ -29,6 +29,14 @@ jobs:
           cache: "pip"
           cache-dependency-path: requirements.txt
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -44,4 +52,7 @@ jobs:
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
           FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          # Claude 큐레이션 — Pro/Max 구독 인증 (API 키 아님)
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_MODEL: sonnet
         run: python stablecoin_digest.py
