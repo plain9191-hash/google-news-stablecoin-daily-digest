@@ -191,14 +191,16 @@ def ask_claude(prompt: str, *, model: str, timeout: int) -> str:
 
     로컬에서는 'claude' 로그인 세션을, CI에서는 CLAUDE_CODE_OAUTH_TOKEN 환경변수를 사용한다.
     """
-    result = subprocess.run(
+    proc = subprocess.run(
         ["claude", "-p", prompt, "--model", model, "--output-format", "text"],
         capture_output=True,
         text=True,
         timeout=timeout,
-        check=True,
     )
-    return result.stdout.strip()
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"claude exit {proc.returncode}: {detail[:600]}")
+    return proc.stdout.strip()
 
 
 def _extract_json_object(raw: str) -> str:
